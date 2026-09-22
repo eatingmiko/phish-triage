@@ -18,6 +18,9 @@ import difflib
 import ipaddress
 from urllib.parse import urlparse
 import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 AUTH_METHODS = ("spf", "dkim", "dmarc")
 
@@ -136,6 +139,10 @@ MEDIUM_RISK_SCORE = 4
 
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
+
+__version__ = "0.1.0"
+
+REPORT_FORMATS = {".json", ".md"}
 
 # Suffixes where the organisation's domain has three labels (e.g. example.com.au).
 # A simplified stand-in for the Public Suffix List.
@@ -755,6 +762,124 @@ def print_risk(risk, findings_by_section):
     print("\nNote: this score is a triage aid, not a verdict. "
           "Confirm with sandboxing and threat intelligence.")
 
+def build_metadata(eml_path, defanged):
+    """Describe this analysis run: tool version, time, input file and its hash."""
+    eml_bytes = Path(eml_path).read_bytes()
+    return {
+        "tool": "phish-triage",
+        "version": __version__,
+        "analysed_file": Path(eml_path).name,
+        "eml_sha256": hashlib.sha256(eml_bytes).hexdigest(),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "defanged": defanged,
+    }
+
+
+def md_cell(value, empty="_(missing)_"):
+    """Format a value for Markdown: code style, with pipes escaped for tables."""
+    if value is None or value == "":
+        return empty
+    text = str(value).replace("`", "'").replace("|", "\\|")
+    return f"`{text}`"
+
+
+def build_markdown(report):
+    """Build a human-readable Markdown version of the report."""
+    meta = report["metadata"]
+    risk = report["risk"]
+    counts = risk["counts"]
+
+    lines = [
+        "# Phishing Triage Report",
+        "",
+        f"**Risk level: {risk['level'].upper()}** (score {risk['score']}: "
+        f"{counts['high']} high, {counts['medium']} medium, {counts['low']} low)",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Analysed file | {md_cell(meta['analysed_file'])} |",
+        f"| File SHA256 | {md_cell(meta['eml_sha256'])} |",
+        f"| Generated (UTC) | {md_cell(meta['generated_at'])} |",
+        f"| Tool version | {md_cell(meta['version'])} |",
+        f"| IOCs defanged | {'Yes' if meta['defanged'] else '**NO: live IOCs**'} |",
+        "",
+        "## Key Headers",
+        "",
+        "| Header | Value |",
+        "|---|---|",
+    ]
+    for name, value in report["headers"].items():
+        lines.append(f"| {name} | {md_cell(value)} |")
+
+    auth = report["auth"]
+    lines += ["", "## Authentication Results", "", "| Check | Result |", "|---|---|"]
+    for method in AUTH_METHODS:
+        lines.append(f"| {method.upper()} | {md_cell(auth[method], empty='_(not present)_')} |")
+
+    lines += ["", "## Received Chain (origin first)", ""]
+    if report["received_chain"]:
+        for hop in report["received_chain"]:
+            lines.append(f"{hop['hop']}. {md_cell(hop['from_host'], '?')} "
+                         f"{md_cell(hop['ip'], '(no IP)')} -> {md_cell(hop['by_host'], '?')} "
+                         f"via {hop['protocol'] or '?'}")
+    else:
+        lines.append("_No Received headers._")
+    lines += ["", f"**Originating IP:** {md_cell(report['originating_ip'], '_(not found)_')}"]
+
+    lines += ["", "## URLs", ""]
+    if report["urls"]:
+        lines += ["| # | URL | Source | Link text |", "|---|---|---|---|"]
+        for number, record in enumerate(report["urls"], start=1):
+            lines.append(f"| {number} | {md_cell(record['url'])} | {record['source']} | "
+                         f"{md_cell(record['link_text'], empty='-')} |")
+    else:
+        lines.append("_None found._")
+
+    lines += ["", "## Attachments", ""]
+    if report["attachments"]:
+        lines += ["| Filename | Declared type | Detected type | Size (bytes) | SHA256 |",
+                  "|---|---|---|---|---|"]
+        for attachment in report["attachments"]:
+            lines.append(f"| {md_cell(safe_filename(attachment['filename']))} | "
+                         f"{md_cell(attachment['declared_type'])} | "
+                         f"{attachment['detected_type']} | {attachment['size_bytes']} | "
+                         f"{md_cell(attachment['sha256'])} |")
+    else:
+        lines.append("_None found._")
+
+    lines += ["", "## Findings"]
+    for section, findings in report["findings"].items():
+        lines += ["", f"### {section}", ""]
+        if not findings:
+            lines.append("_No issues found._")
+        for finding in findings:
+            lines.append(f"- **{finding['severity'].upper()}** {finding['message']}")
+
+    lines += ["", "## Risk Reasons (highest impact first)", ""]
+    scored = score_findings(report["findings"])
+    if not scored:
+        lines.append("_No phishing indicators found._")
+    for points, _, section, message in scored:
+        lines.append(f"- +{points} {section}: {message}")
+
+    lines += ["", "---", "",
+              "_This report is a triage aid, not a verdict. "
+              "Confirm with sandboxing and threat intelligence._"]
+    return "\n".join(lines) + "\n"
+
+
+def write_report(report, path):
+    """Write the report to a .json or .md file, creating folders as needed."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.suffix.lower() == ".json":
+        content = json.dumps(report, indent=2) + "\n"
+    else:
+        content = build_markdown(report)
+
+    path.write_text(content, encoding="utf-8")
+
 def build_report(msg):
     """Run every analysis step and collect the results into one dictionary."""
     headers = get_key_headers(msg)
@@ -816,7 +941,14 @@ def main():
         action="store_true",
         help="Show URLs, domains and IPs in live (clickable) form. Use with care.",
     )
+    parser.add_argument(
+        "-o", "--output",
+        help="Also write the report to a file ending in .json or .md, "
+             "e.g. reports/phishing.json",
+    )
     args = parser.parse_args()
+    if args.output and Path(args.output).suffix.lower() not in REPORT_FORMATS:
+        parser.error("--output must end in .json or .md")
 
     try:
         msg = load_email(args.eml_file)
@@ -829,8 +961,16 @@ def main():
 
     report = build_report(msg)
     display_report = report if args.no_defang else defang_report(report)
+    display_report["metadata"] = build_metadata(args.eml_file, defanged=not args.no_defang)
     print_report(display_report)
 
+    if args.output:
+        try:
+            write_report(display_report, args.output)
+        except OSError as error:
+            print(f"Error: could not write report: {error}", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nReport written to {args.output}")
 
 if __name__ == "__main__":
     main()
