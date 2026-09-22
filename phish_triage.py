@@ -17,6 +17,7 @@ from html.parser import HTMLParser
 import difflib
 import ipaddress
 from urllib.parse import urlparse
+import hashlib
 
 AUTH_METHODS = ("spf", "dkim", "dmarc")
 
@@ -83,6 +84,41 @@ MIN_BRAND_LENGTH_FOR_FUZZY = 5  # short brand names cause too many fuzzy false p
 
 # A domain name appearing in link text, e.g. "account.microsoft.com".
 DOMAIN_IN_TEXT_PATTERN = re.compile(r"\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b", re.IGNORECASE)
+
+# File types that can run code directly when opened.
+HIGH_RISK_EXTENSIONS = {
+    "exe", "scr", "com", "pif", "bat", "cmd", "msi", "dll", "cpl",
+    "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "ps1", "lnk", "jar", "reg",
+    "iso", "img", "vhd", "vhdx", "xll",
+}
+
+# Common malware carriers: macro documents, archives, HTML smuggling, OneNote.
+MEDIUM_RISK_EXTENSIONS = {
+    "docm", "xlsm", "pptm", "dotm", "xlsb",
+    "zip", "rar", "7z", "gz", "tar", "cab",
+    "html", "htm", "svg", "one",
+}
+
+# Harmless-looking extensions attackers place before the real one, e.g. invoice.pdf.exe
+DECOY_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png", "txt"}
+
+# Extensions where Windows executable content is expected.
+EXECUTABLE_EXTENSIONS = {"exe", "dll", "scr", "com", "cpl", "sys"}
+
+# File signatures ("magic bytes"): the first bytes reveal the real file type.
+FILE_SIGNATURES = {
+    b"MZ": "Windows executable",
+    b"%PDF": "PDF document",
+    b"PK\x03\x04": "ZIP archive (also docx/xlsx/pptx)",
+    b"\xd0\xcf\x11\xe0": "Legacy Office document (doc/xls/ppt)",
+    b"Rar!": "RAR archive",
+    b"7z\xbc\xaf": "7-Zip archive",
+    b"\x89PNG": "PNG image",
+    b"\xff\xd8\xff": "JPEG image",
+}
+
+# Unicode right-to-left override: reverses how the following text is displayed.
+RTLO_CHARACTER = "\u202e"
 
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
@@ -506,6 +542,103 @@ def check_urls(urls):
         findings.extend(analyse_url(record))
     return findings
 
+def safe_filename(name):
+    """Make a filename safe to print by exposing hidden direction-changing characters."""
+    return name.replace(RTLO_CHARACTER, "[RTLO]")
+
+
+def get_extensions(filename):
+    """Return every extension in a filename, lowercased: 'a.PDF.exe' -> ['pdf', 'exe']."""
+    parts = filename.lower().split(".")
+    return [part.strip() for part in parts[1:]]
+
+
+def identify_signature(data):
+    """Identify a file's real type from its first bytes. Returns a description."""
+    for signature, description in FILE_SIGNATURES.items():
+        if data.startswith(signature):
+            return description
+    return "unknown"
+
+
+def extract_attachments(msg):
+    """Return a list of attachment records.
+
+    Attachment content is decoded and hashed in memory only. It is never
+    written to disk, opened or executed.
+    """
+    attachments = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+
+        filename = part.get_filename()
+        if part.get_content_disposition() != "attachment" and not filename:
+            continue  # ordinary body text, not an attachment
+
+        data = part.get_payload(decode=True) or b""
+        attachments.append({
+            "filename": filename or "(no filename)",
+            "declared_type": part.get_content_type(),
+            "detected_type": identify_signature(data),
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+    return attachments
+
+
+def check_attachments(attachments):
+    """Check each attachment for risky types and disguise tricks. Return findings."""
+    findings = []
+
+    for attachment in attachments:
+        name = attachment["filename"]
+        extensions = get_extensions(name)
+        final_ext = extensions[-1] if extensions else ""
+        reasons = []
+
+        if RTLO_CHARACTER in name:
+            reasons.append(("high", "filename contains a right-to-left override "
+                                    "character that disguises the real extension"))
+
+        if final_ext in HIGH_RISK_EXTENSIONS:
+            reasons.append(("high", f"high-risk file type (.{final_ext}) that can run code"))
+        elif final_ext in MEDIUM_RISK_EXTENSIONS:
+            reasons.append(("medium", f"risky file type (.{final_ext}); a common malware carrier"))
+
+        if (len(extensions) >= 2
+                and extensions[-2] in DECOY_EXTENSIONS
+                and final_ext in HIGH_RISK_EXTENSIONS | MEDIUM_RISK_EXTENSIONS):
+            reasons.append(("high", f"double extension disguises a .{final_ext} "
+                                    f"as a .{extensions[-2]}"))
+
+        if (attachment["detected_type"] == "Windows executable"
+                and final_ext not in EXECUTABLE_EXTENSIONS):
+            reasons.append(("high", "content is a Windows executable despite its filename"))
+
+        for severity, reason in reasons:
+            findings.append({
+                "severity": severity,
+                "message": f"{safe_filename(name)} -> {reason}",
+            })
+
+    return findings
+
+
+def print_attachments(attachments):
+    """Print each attachment's details and hash."""
+    print(f"\n=== Attachments ({len(attachments)}) ===")
+    if not attachments:
+        print("(none)")
+        return
+
+    for number, attachment in enumerate(attachments, start=1):
+        print(f"{number}. {safe_filename(attachment['filename'])}")
+        print(f"   declared type : {attachment['declared_type']}")
+        print(f"   detected type : {attachment['detected_type']}")
+        print(f"   size          : {attachment['size_bytes']} bytes")
+        print(f"   SHA256        : {attachment['sha256']}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -539,6 +672,10 @@ def main():
     urls = extract_urls(plain_text, html)
     print_urls(urls)
     print_findings("URL Findings", check_urls(urls))
+
+    attachments = extract_attachments(msg)
+    print_attachments(attachments)
+    print_findings("Attachment Findings", check_attachments(attachments))
 
 
 
