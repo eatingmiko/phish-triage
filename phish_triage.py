@@ -33,6 +33,17 @@ AUTH_FAILURE_SEVERITY = {
     ("dmarc", "none"): "low",
 }
 
+# Parts of a Received header. Group 1 of each pattern is the value we want.
+RECEIVED_FROM_PATTERN = re.compile(r"\bfrom\s+([\w.-]+)", re.IGNORECASE)
+RECEIVED_BY_PATTERN = re.compile(r"\bby\s+([\w.-]+)", re.IGNORECASE)
+RECEIVED_WITH_PATTERN = re.compile(r"\bwith\s+(\w+)", re.IGNORECASE)
+
+# An IPv4 address inside square brackets, e.g. [198.51.100.23].
+IPV4_IN_BRACKETS_PATTERN = re.compile(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]")
+
+# "(unknown [" means the receiving server found no reverse DNS for the sender's IP.
+UNKNOWN_RDNS_PATTERN = re.compile(r"\(unknown\s*\[", re.IGNORECASE)
+
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
 
@@ -186,6 +197,76 @@ def print_auth_results(results):
     for method in AUTH_METHODS:
         print(f"{method.upper():<13} : {results[method] or '(not present)'}")
 
+def _first_group(pattern, text):
+    """Return group 1 of the first match of pattern in text, or None."""
+    match = pattern.search(text)
+    return match.group(1) if match else None
+
+
+def parse_received_chain(msg):
+    """Parse Received headers into a list of hops, in the order the email travelled."""
+    raw_headers = msg.get_all("Received") or []
+    hops = []
+
+    # Headers are stacked newest-first, so reverse them to get origin-first.
+    for number, raw in enumerate(reversed(raw_headers), start=1):
+        text = " ".join(str(raw).split())  # collapse line breaks and tabs
+        timestamp = text.rsplit(";", 1)[1].strip() if ";" in text else None
+
+        hops.append({
+            "hop": number,
+            "from_host": _first_group(RECEIVED_FROM_PATTERN, text),
+            "ip": _first_group(IPV4_IN_BRACKETS_PATTERN, text),
+            "by_host": _first_group(RECEIVED_BY_PATTERN, text),
+            "protocol": _first_group(RECEIVED_WITH_PATTERN, text),
+            "timestamp": timestamp,
+            "unknown_rdns": bool(UNKNOWN_RDNS_PATTERN.search(text)),
+        })
+    return hops
+
+
+def get_originating_ip(hops):
+    """Return the IP of the earliest hop that recorded one, or None."""
+    for hop in hops:
+        if hop["ip"]:
+            return hop["ip"]
+    return None
+
+
+def check_received_chain(hops):
+    """Turn the Received chain into a list of findings."""
+    findings = []
+
+    if not hops:
+        findings.append({
+            "severity": "low",
+            "message": "No Received headers found; delivery path cannot be traced",
+        })
+        return findings
+
+    for hop in hops:
+        if hop["unknown_rdns"]:
+            findings.append({
+                "severity": "low",
+                "message": f"Hop {hop['hop']}: sending server {hop['ip'] or '(no IP)'} "
+                           f"has no reverse DNS (shown as 'unknown')",
+            })
+    return findings
+
+
+def print_received_chain(hops):
+    """Print each hop in travel order, then the originating IP."""
+    print("\n=== Received Chain (origin first) ===")
+    if not hops:
+        print("(no Received headers)")
+        return
+
+    for hop in hops:
+        print(f"Hop {hop['hop']}: {hop['from_host'] or '?'} [{hop['ip'] or 'no IP'}] -> "
+              f"{hop['by_host'] or '?'} via {hop['protocol'] or '?'}")
+        print(f"       {hop['timestamp'] or '(no timestamp)'}")
+    print(f"Originating IP : {get_originating_ip(hops) or '(not found)'}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -210,6 +291,10 @@ def main():
     auth = parse_auth_results(msg)
     print_auth_results(auth)
     print_findings("Authentication Findings", check_auth_results(auth))
+
+    hops = parse_received_chain(msg)
+    print_received_chain(hops)
+    print_findings("Received Chain Findings", check_received_chain(hops))
 
 
 if __name__ == "__main__":
