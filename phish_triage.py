@@ -14,6 +14,9 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 import re
 from html.parser import HTMLParser
+import difflib
+import ipaddress
+from urllib.parse import urlparse
 
 AUTH_METHODS = ("spf", "dkim", "dmarc")
 
@@ -50,6 +53,36 @@ URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 # Punctuation often stuck to the end of a URL in prose, e.g. "visit https://x.com."
 URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
+
+URL_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd",
+    "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "tiny.cc", "rb.gy",
+}
+
+# Commonly impersonated brands -> the real domains they use.
+BRAND_DOMAINS = {
+    "microsoft": {"microsoft.com", "microsoftonline.com", "office.com", "live.com", "outlook.com"},
+    "paypal": {"paypal.com"},
+    "apple": {"apple.com", "icloud.com"},
+    "google": {"google.com", "gmail.com"},
+    "amazon": {"amazon.com", "amazon.com.au"},
+    "linkedin": {"linkedin.com"},
+    "docusign": {"docusign.com", "docusign.net"},
+    "commbank": {"commbank.com.au"},
+    "westpac": {"westpac.com.au"},
+    "auspost": {"auspost.com.au"},
+    "mygov": {"my.gov.au"},
+}
+
+# Characters attackers swap in to imitate letters.
+HOMOGLYPH_TABLE = str.maketrans({"0": "o", "1": "l", "3": "e", "5": "s", "4": "a"})
+MULTI_CHAR_HOMOGLYPHS = {"rn": "m", "vv": "w"}
+
+LOOKALIKE_SIMILARITY = 0.85  # difflib ratio at or above this counts as a lookalike
+MIN_BRAND_LENGTH_FOR_FUZZY = 5  # short brand names cause too many fuzzy false positives
+
+# A domain name appearing in link text, e.g. "account.microsoft.com".
+DOMAIN_IN_TEXT_PATTERN = re.compile(r"\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b", re.IGNORECASE)
 
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
@@ -379,6 +412,100 @@ def print_urls(urls):
             line += f' | link text: "{text}"'
         print(line)
 
+def is_ip_address(host):
+    """Return True if host is a valid IPv4 or IPv6 address."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def normalise_homoglyphs(text):
+    """Replace common lookalike characters with the letters they imitate."""
+    text = text.lower().translate(HOMOGLYPH_TABLE)
+    for fake, real in MULTI_CHAR_HOMOGLYPHS.items():
+        text = text.replace(fake, real)
+    return text
+
+
+def find_lookalike_brand(host):
+    """Return the brand a hostname appears to imitate, or None."""
+    base = get_base_domain(host)
+    if base is None:
+        return None
+
+    # A genuine brand domain is not a lookalike.
+    if any(base in legit_domains for legit_domains in BRAND_DOMAINS.values()):
+        return None
+
+    tokens = re.split(r"[.-]", normalise_homoglyphs(host))
+    for brand in BRAND_DOMAINS:
+        for token in tokens:
+            if token == brand:
+                return brand
+            if len(brand) >= MIN_BRAND_LENGTH_FOR_FUZZY:
+                similarity = difflib.SequenceMatcher(None, token, brand).ratio()
+                if similarity >= LOOKALIKE_SIMILARITY:
+                    return brand
+    return None
+
+
+def analyse_url(record):
+    """Check one URL record for phishing indicators. Return a list of findings."""
+    url = record["url"]
+    findings = []
+
+    def add(severity, reason):
+        findings.append({"severity": severity, "message": f"{url} -> {reason}"})
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+    except ValueError:
+        host = None
+
+    if not host:
+        add("low", "hostname could not be parsed")
+        return findings
+
+    if parsed.username:
+        add("high", f"contains an '@' trick; the browser would actually go to {host}")
+
+    host_is_ip = is_ip_address(host)
+    if host_is_ip:
+        add("medium", "uses a raw IP address instead of a domain name")
+
+    if "xn--" in host:
+        add("medium", "punycode (internationalised) domain; possible homograph attack")
+
+    base = host if host_is_ip else get_base_domain(host)
+    if base in URL_SHORTENERS:
+        add("low", "URL shortener hides the real destination")
+
+    link_text = record["link_text"]
+    if link_text:
+        text_match = DOMAIN_IN_TEXT_PATTERN.search(link_text)
+        if text_match:
+            shown = get_base_domain(text_match.group(1).lower())
+            if shown != base:
+                add("high", f"link text shows {shown} but the link goes to {base}")
+
+    if not host_is_ip:
+        brand = find_lookalike_brand(host)
+        if brand:
+            add("high", f"domain imitates '{brand}'")
+
+    return findings
+
+
+def check_urls(urls):
+    """Analyse every URL and return all findings as one list."""
+    findings = []
+    for record in urls:
+        findings.extend(analyse_url(record))
+    return findings
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -411,6 +538,8 @@ def main():
     plain_text, html = get_bodies(msg)
     urls = extract_urls(plain_text, html)
     print_urls(urls)
+    print_findings("URL Findings", check_urls(urls))
+
 
 
 if __name__ == "__main__":
