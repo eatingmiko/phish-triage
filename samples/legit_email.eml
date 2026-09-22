@@ -1,0 +1,23 @@
+Return-Path: <servicedesk@example.com>
+Received: from mail.example.com (mail.example.com [192.0.2.10])
+	by mx.example.com with ESMTPS id 4F2A1B3C
+	for <jordan.smith@example.com>; Mon, 21 Sep 2026 09:14:02 +1000
+Authentication-Results: mx.example.com;
+	spf=pass smtp.mailfrom=example.com;
+	dkim=pass header.d=example.com;
+	dmarc=pass header.from=example.com
+From: "IT Service Desk" <servicedesk@example.com>
+To: Jordan Smith <jordan.smith@example.com>
+Subject: Scheduled maintenance this Saturday
+Date: Mon, 21 Sep 2026 09:14:00 +1000
+Message-ID: <20260921091400.12345@mail.example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi Jordan,
+
+The file server will be offline for maintenance this Saturday from 8am to 12pm.
+Status updates will be posted at https://status.example.com/maintenance
+
+Thanks,
+IT Service Desk

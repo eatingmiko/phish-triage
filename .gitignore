@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Generated reports
+reports/
+
+# Editor / OS clutter
+.vscode/
+Thumbs.db
+
+# Safety net: never commit real phishing samples
+samples/real/

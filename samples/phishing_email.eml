@@ -1,0 +1,51 @@
+Return-Path: <bounce-7781@mailer-d4x9.net>
+Received: from mx.example.com (mx.example.com [192.0.2.25])
+	by mailbox.example.com with LMTP; Tue, 22 Sep 2026 03:12:41 +1000
+Authentication-Results: mx.example.com;
+	spf=pass smtp.mailfrom=mailer-d4x9.net;
+	dkim=none;
+	dmarc=fail (p=none) header.from=micros0ft-support.com
+Received: from smtp.mailer-d4x9.net (unknown [198.51.100.23])
+	by mx.example.com with ESMTP id 9C8D7E6F
+	for <jordan.smith@example.com>; Tue, 22 Sep 2026 03:12:40 +1000
+From: "Microsoft 365 Security" <security@micros0ft-support.com>
+Reply-To: account-verify@secure-helpdesk.example
+To: jordan.smith@example.com
+Subject: URGENT: Unusual sign-in activity detected on your account
+Date: Tue, 22 Sep 2026 03:12:38 +1000
+Message-ID: <a81f93c2e4@smtp.mailer-d4x9.net>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MIXED_BOUNDARY"
+
+--MIXED_BOUNDARY
+Content-Type: multipart/alternative; boundary="ALT_BOUNDARY"
+
+--ALT_BOUNDARY
+Content-Type: text/plain; charset="utf-8"
+
+We detected an unusual sign-in to your Microsoft 365 account.
+If this wasn't you, reset your password within 24 hours:
+http://micros0ft-support.com/reset?user=jordan.smith
+
+Microsoft 365 Security Team
+
+--ALT_BOUNDARY
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<p>We detected an unusual sign-in to your Microsoft 365 account.</p>
+<p>Verify your account now: <a href="http://203.0.113.45/login.php">https://account.microsoft.com/verify</a></p>
+<p>Or review recent activity: <a href="https://bit.ly/3xFakeLnk">Review activity</a></p>
+<p>Microsoft 365 Security Team</p>
+</body></html>
+
+--ALT_BOUNDARY--
+
+--MIXED_BOUNDARY
+Content-Type: application/octet-stream; name="Invoice_4471.pdf.exe"
+Content-Disposition: attachment; filename="Invoice_4471.pdf.exe"
+Content-Transfer-Encoding: base64
+
+SGFybWxlc3MgdGVzdCBmaWxl
+
+--MIXED_BOUNDARY--
