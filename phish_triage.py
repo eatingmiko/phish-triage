@@ -726,6 +726,11 @@ def main():
         description="Analyse a .eml file and produce a phishing triage report."
     )
     parser.add_argument("eml_file", help="Path to the .eml file to analyse")
+    parser.add_argument(
+        "--no-defang",
+        action="store_true",
+        help="Show URLs, domains and IPs in live (clickable) form. Use with care.",
+    )
     args = parser.parse_args()
 
     try:
@@ -738,8 +743,8 @@ def main():
         sys.exit(1)
 
     report = build_report(msg)
-    print_report(report)
-
+    display_report = report if args.no_defang else defang_report(report)
+    print_report(display_report)
 
 
 if __name__ == "__main__":
