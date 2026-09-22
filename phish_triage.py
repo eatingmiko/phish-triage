@@ -13,6 +13,7 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
 import re
+from html.parser import HTMLParser
 
 AUTH_METHODS = ("spf", "dkim", "dmarc")
 
@@ -43,6 +44,12 @@ IPV4_IN_BRACKETS_PATTERN = re.compile(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]")
 
 # "(unknown [" means the receiving server found no reverse DNS for the sender's IP.
 UNKNOWN_RDNS_PATTERN = re.compile(r"\(unknown\s*\[", re.IGNORECASE)
+
+# http:// or https:// followed by everything up to whitespace, a quote or an angle bracket.
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+# Punctuation often stuck to the end of a URL in prose, e.g. "visit https://x.com."
+URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
 
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
@@ -267,6 +274,111 @@ def print_received_chain(hops):
         print(f"       {hop['timestamp'] or '(no timestamp)'}")
     print(f"Originating IP : {get_originating_ip(hops) or '(not found)'}")
 
+class LinkExtractor(HTMLParser):
+    """Collect every <a href="..."> link and its visible text from an HTML document.
+
+    HTMLParser reads the HTML and calls the handle_* methods below as it meets
+    each start tag, piece of text and end tag. Nothing is rendered or executed.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.links = []            # list of (href, visible_text) tuples
+        self._current_href = None  # set while we are inside an <a> tag
+        self._current_text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self._current_href = href.strip()
+                self._current_text = []
+
+    def handle_data(self, data):
+        if self._current_href is not None:
+            self._current_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._current_href is not None:
+            text = " ".join("".join(self._current_text).split())
+            self.links.append((self._current_href, text))
+            self._current_href = None
+
+
+def get_bodies(msg):
+    """Return (plain_text, html) from the email body, skipping attachments."""
+    plain_parts = []
+    html_parts = []
+
+    for part in msg.walk():
+        if part.is_multipart():
+            continue  # containers hold other parts, not content
+        if part.get_content_disposition() == "attachment":
+            continue  # never treat attachments as body text
+
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+
+        try:
+            content = part.get_content()
+        except (LookupError, UnicodeDecodeError):
+            # Unknown or broken charset: decode the raw bytes as best we can.
+            payload = part.get_payload(decode=True) or b""
+            content = payload.decode("utf-8", errors="replace")
+
+        if content_type == "text/plain":
+            plain_parts.append(content)
+        else:
+            html_parts.append(content)
+
+    return "\n".join(plain_parts), "\n".join(html_parts)
+
+
+def extract_urls(plain_text, html):
+    """Return a de-duplicated list of URL records from the plain-text and HTML bodies.
+
+    Each record is a dict: {"url": ..., "source": ..., "link_text": ...}.
+    """
+    urls = []
+    seen = set()
+
+    # HTML first, so links keep their visible text if the same URL
+    # also appears in the plain-text version.
+    if html:
+        extractor = LinkExtractor()
+        extractor.feed(html)
+        for href, text in extractor.links:
+            if not href.lower().startswith(("http://", "https://")):
+                continue  # skip mailto:, tel:, #anchors etc.
+            if href not in seen:
+                seen.add(href)
+                urls.append({"url": href, "source": "HTML", "link_text": text})
+
+    for match in URL_PATTERN.findall(plain_text):
+        url = match.rstrip(URL_TRAILING_PUNCTUATION)
+        if url not in seen:
+            seen.add(url)
+            urls.append({"url": url, "source": "plain text", "link_text": None})
+
+    return urls
+
+
+def print_urls(urls):
+    """Print each extracted URL with where it came from and any link text."""
+    print(f"\n=== URLs Found ({len(urls)}) ===")
+    if not urls:
+        print("(none)")
+        return
+
+    for number, record in enumerate(urls, start=1):
+        print(f"{number}. {record['url']}")
+        line = f"   source: {record['source']}"
+        if record["link_text"]:
+            text = record["link_text"]
+            line += f' | link text: "{text}"'
+        print(line)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -295,6 +407,10 @@ def main():
     hops = parse_received_chain(msg)
     print_received_chain(hops)
     print_findings("Received Chain Findings", check_received_chain(hops))
+
+    plain_text, html = get_bodies(msg)
+    urls = extract_urls(plain_text, html)
+    print_urls(urls)
 
 
 if __name__ == "__main__":
