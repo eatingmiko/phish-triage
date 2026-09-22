@@ -12,6 +12,26 @@ import sys
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
+import re
+
+AUTH_METHODS = ("spf", "dkim", "dmarc")
+
+# Matches "spf=pass", "dkim = fail" etc. Group 1 = method, group 2 = result.
+AUTH_RESULT_PATTERN = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)", re.IGNORECASE)
+
+# Matches the DMARC policy in brackets, e.g. "(p=none)". Group 1 = policy.
+DMARC_POLICY_PATTERN = re.compile(r"\(p=([a-z]+)", re.IGNORECASE)
+
+# (method, result) -> severity. Results not listed here (e.g. pass) are not findings.
+AUTH_FAILURE_SEVERITY = {
+    ("spf", "fail"): "medium",
+    ("spf", "softfail"): "low",
+    ("spf", "none"): "low",
+    ("dkim", "fail"): "medium",
+    ("dkim", "none"): "low",
+    ("dmarc", "fail"): "high",
+    ("dmarc", "none"): "low",
+}
 
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
@@ -100,6 +120,72 @@ def print_findings(title, findings):
     for finding in findings:
         print(f"[{finding['severity'].upper()}] {finding['message']}")
 
+def parse_auth_results(msg):
+    """Extract SPF, DKIM and DMARC results from the topmost Authentication-Results header.
+
+    Returns a dict with a result (or None) for each method, the DMARC policy,
+    and how many Authentication-Results headers were found.
+    """
+    all_headers = msg.get_all("Authentication-Results") or []
+    results = {method: None for method in AUTH_METHODS}
+    results["dmarc_policy"] = None
+    results["header_count"] = len(all_headers)
+
+    if not all_headers:
+        return results
+
+    # Only trust the topmost header: it was added by our own receiving server.
+    top_header = str(all_headers[0])
+
+    for method, result in AUTH_RESULT_PATTERN.findall(top_header):
+        method = method.lower()
+        if results[method] is None:  # keep the first result for each method
+            results[method] = result.lower()
+
+    policy_match = DMARC_POLICY_PATTERN.search(top_header)
+    if policy_match:
+        results["dmarc_policy"] = policy_match.group(1).lower()
+
+    return results
+
+
+def check_auth_results(results):
+    """Turn authentication results into a list of findings."""
+    findings = []
+
+    if results["header_count"] == 0:
+        findings.append({
+            "severity": "low",
+            "message": "No Authentication-Results header; sender authentication could not be verified",
+        })
+        return findings
+
+    for method in AUTH_METHODS:
+        result = results[method]
+        if result is None:
+            findings.append({
+                "severity": "low",
+                "message": f"{method.upper()} result not present in Authentication-Results",
+            })
+            continue
+
+        severity = AUTH_FAILURE_SEVERITY.get((method, result))
+        if severity:
+            message = f"{method.upper()} = {result}"
+            if method == "dmarc" and results["dmarc_policy"]:
+                message += f" (sender domain policy: p={results['dmarc_policy']})"
+            findings.append({"severity": severity, "message": message})
+
+    return findings
+
+
+def print_auth_results(results):
+    """Print the raw SPF, DKIM and DMARC results."""
+    print("\n=== Authentication Results ===")
+    print(f"{'Headers found':<13} : {results['header_count']} (using the topmost)")
+    for method in AUTH_METHODS:
+        print(f"{method.upper():<13} : {results[method] or '(not present)'}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -120,6 +206,10 @@ def main():
     headers = get_key_headers(msg)
     print_headers(headers)
     print_findings("Header Mismatches", check_mismatches(headers))
+
+    auth = parse_auth_results(msg)
+    print_auth_results(auth)
+    print_findings("Authentication Findings", check_auth_results(auth))
 
 
 if __name__ == "__main__":
