@@ -129,6 +129,11 @@ DEFANG_HOST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Points per finding severity, and the totals that map to each risk level.
+SEVERITY_POINTS = {"low": 1, "medium": 3, "high": 5}
+HIGH_RISK_SCORE = 10
+MEDIUM_RISK_SCORE = 4
+
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
 
@@ -207,6 +212,35 @@ def check_mismatches(headers):
             })
     return findings
 
+def check_sender(headers):
+    """Check the From header for brand impersonation. Return a list of findings."""
+    findings = []
+    from_value = headers.get("From") or ""
+    display_name, _ = parseaddr(from_value)
+    domain = extract_domain(from_value)
+    if not domain:
+        return findings  # a missing From is already reported by check_mismatches
+    base = get_base_domain(domain)
+
+    brand = find_lookalike_brand(domain)
+    if brand:
+        findings.append({
+            "severity": "high",
+            "message": f"From domain ({domain}) imitates '{brand}'",
+        })
+
+    # Display-name spoofing: the name mentions a brand the domain doesn't belong to.
+    name_tokens = re.split(r"[^a-z0-9]+", display_name.lower())
+    for brand_name, legit_domains in BRAND_DOMAINS.items():
+        if brand_name in name_tokens and base not in legit_domains:
+            findings.append({
+                "severity": "medium",
+                "message": f"Display name '{display_name}' mentions '{brand_name}' "
+                           f"but the sender domain is {base}",
+            })
+            break
+
+    return findings
 
 def print_findings(title, findings):
     """Print a section heading and each finding with its severity."""
@@ -676,6 +710,51 @@ def defang_report(report):
     safe["findings"]["Attachment Findings"] = report["findings"]["Attachment Findings"]
     return safe
 
+def score_findings(findings_by_section):
+    """Return (points, severity, section, message) for every finding, highest points first."""
+    scored = []
+    for section, findings in findings_by_section.items():
+        for finding in findings:
+            points = SEVERITY_POINTS.get(finding["severity"], 0)
+            scored.append((points, finding["severity"], section, finding["message"]))
+    return sorted(scored, key=lambda item: item[0], reverse=True)
+
+
+def calculate_risk(findings_by_section):
+    """Add up the points for all findings and return the score, level and counts."""
+    scored = score_findings(findings_by_section)
+    score = sum(item[0] for item in scored)
+    severities = [item[1] for item in scored]
+    counts = {severity: severities.count(severity) for severity in SEVERITY_POINTS}
+
+    if score >= HIGH_RISK_SCORE:
+        level = "High"
+    elif score >= MEDIUM_RISK_SCORE or counts["high"] > 0:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {"score": score, "level": level, "counts": counts}
+
+
+def print_risk(risk, findings_by_section):
+    """Print the risk level, score and every contributing reason."""
+    counts = risk["counts"]
+    print("\n=== Risk Assessment ===")
+    print(f"Risk level : {risk['level'].upper()} (score {risk['score']})")
+    print(f"Findings   : {counts['high']} high, {counts['medium']} medium, {counts['low']} low")
+
+    scored = score_findings(findings_by_section)
+    if scored:
+        print("Reasons (highest impact first):")
+        for points, _, section, message in scored:
+            print(f"  +{points}  {section}: {message}")
+    else:
+        print("No phishing indicators found.")
+
+    print("\nNote: this score is a triage aid, not a verdict. "
+          "Confirm with sandboxing and threat intelligence.")
+
 def build_report(msg):
     """Run every analysis step and collect the results into one dictionary."""
     headers = get_key_headers(msg)
@@ -685,6 +764,15 @@ def build_report(msg):
     urls = extract_urls(plain_text, html)
     attachments = extract_attachments(msg)
 
+    findings = {
+        "Header Mismatches": check_mismatches(headers),
+        "Sender Findings": check_sender(headers),
+        "Authentication Findings": check_auth_results(auth),
+        "Received Chain Findings": check_received_chain(hops),
+        "URL Findings": check_urls(urls),
+        "Attachment Findings": check_attachments(attachments),
+    }
+
     return {
         "headers": headers,
         "auth": auth,
@@ -692,13 +780,8 @@ def build_report(msg):
         "originating_ip": get_originating_ip(hops),
         "urls": urls,
         "attachments": attachments,
-        "findings": {
-            "Header Mismatches": check_mismatches(headers),
-            "Authentication Findings": check_auth_results(auth),
-            "Received Chain Findings": check_received_chain(hops),
-            "URL Findings": check_urls(urls),
-            "Attachment Findings": check_attachments(attachments),
-        },
+        "findings": findings,
+        "risk": calculate_risk(findings),
     }
 
 
@@ -708,6 +791,7 @@ def print_report(report):
 
     print_headers(report["headers"])
     print_findings("Header Mismatches", findings["Header Mismatches"])
+    print_findings("Sender Findings", findings["Sender Findings"])
 
     print_auth_results(report["auth"])
     print_findings("Authentication Findings", findings["Authentication Findings"])
@@ -720,6 +804,7 @@ def print_report(report):
 
     print_attachments(report["attachments"])
     print_findings("Attachment Findings", findings["Attachment Findings"])
+    print_risk(report["risk"], findings)
 
 def main():
     parser = argparse.ArgumentParser(
