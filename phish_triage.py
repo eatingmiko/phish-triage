@@ -120,6 +120,15 @@ FILE_SIGNATURES = {
 # Unicode right-to-left override: reverses how the following text is displayed.
 RTLO_CHARACTER = "\u202e"
 
+# http:// or https:// (group 1 keeps the optional "s") for defanging.
+DEFANG_SCHEME_PATTERN = re.compile(r"\bhttp(s?)://", re.IGNORECASE)
+
+# IPv4 addresses or domain names, whose dots get defanged.
+DEFANG_HOST_PATTERN = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b",
+    re.IGNORECASE,
+)
+
 # The headers shown in the triage report, in display order.
 KEY_HEADERS = ["From", "Reply-To", "Return-Path", "Subject", "Date", "Message-ID"]
 
@@ -638,6 +647,34 @@ def print_attachments(attachments):
         print(f"   detected type : {attachment['detected_type']}")
         print(f"   size          : {attachment['size_bytes']} bytes")
         print(f"   SHA256        : {attachment['sha256']}")
+
+def defang_text(text):
+    """Defang URLs, domains and IPs in a string: http://a.com -> hxxp://a[.]com."""
+    text = DEFANG_SCHEME_PATTERN.sub(r"hxxp\1://", text)
+    return DEFANG_HOST_PATTERN.sub(lambda match: match.group(0).replace(".", "[.]"), text)
+
+
+def defang_value(value):
+    """Recursively defang every string inside dicts and lists."""
+    if isinstance(value, str):
+        return defang_text(value)
+    if isinstance(value, dict):
+        return {key: defang_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [defang_value(item) for item in value]
+    return value  # numbers, booleans and None are left unchanged
+
+
+def defang_report(report):
+    """Return a defanged copy of the report for display. The original is not changed.
+
+    Attachment filenames are kept as-is: they are not clickable or resolvable,
+    and defanging them would only make them harder to read.
+    """
+    safe = defang_value(report)
+    safe["attachments"] = report["attachments"]
+    safe["findings"]["Attachment Findings"] = report["findings"]["Attachment Findings"]
+    return safe
 
 def build_report(msg):
     """Run every analysis step and collect the results into one dictionary."""
