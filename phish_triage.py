@@ -639,6 +639,50 @@ def print_attachments(attachments):
         print(f"   size          : {attachment['size_bytes']} bytes")
         print(f"   SHA256        : {attachment['sha256']}")
 
+def build_report(msg):
+    """Run every analysis step and collect the results into one dictionary."""
+    headers = get_key_headers(msg)
+    auth = parse_auth_results(msg)
+    hops = parse_received_chain(msg)
+    plain_text, html = get_bodies(msg)
+    urls = extract_urls(plain_text, html)
+    attachments = extract_attachments(msg)
+
+    return {
+        "headers": headers,
+        "auth": auth,
+        "received_chain": hops,
+        "originating_ip": get_originating_ip(hops),
+        "urls": urls,
+        "attachments": attachments,
+        "findings": {
+            "Header Mismatches": check_mismatches(headers),
+            "Authentication Findings": check_auth_results(auth),
+            "Received Chain Findings": check_received_chain(hops),
+            "URL Findings": check_urls(urls),
+            "Attachment Findings": check_attachments(attachments),
+        },
+    }
+
+
+def print_report(report):
+    """Print every section of the report to the console."""
+    findings = report["findings"]
+
+    print_headers(report["headers"])
+    print_findings("Header Mismatches", findings["Header Mismatches"])
+
+    print_auth_results(report["auth"])
+    print_findings("Authentication Findings", findings["Authentication Findings"])
+
+    print_received_chain(report["received_chain"])
+    print_findings("Received Chain Findings", findings["Received Chain Findings"])
+
+    print_urls(report["urls"])
+    print_findings("URL Findings", findings["URL Findings"])
+
+    print_attachments(report["attachments"])
+    print_findings("Attachment Findings", findings["Attachment Findings"])
 
 def main():
     parser = argparse.ArgumentParser(
@@ -656,26 +700,8 @@ def main():
         print(f"Error: permission denied: {args.eml_file}", file=sys.stderr)
         sys.exit(1)
 
-    headers = get_key_headers(msg)
-    print_headers(headers)
-    print_findings("Header Mismatches", check_mismatches(headers))
-
-    auth = parse_auth_results(msg)
-    print_auth_results(auth)
-    print_findings("Authentication Findings", check_auth_results(auth))
-
-    hops = parse_received_chain(msg)
-    print_received_chain(hops)
-    print_findings("Received Chain Findings", check_received_chain(hops))
-
-    plain_text, html = get_bodies(msg)
-    urls = extract_urls(plain_text, html)
-    print_urls(urls)
-    print_findings("URL Findings", check_urls(urls))
-
-    attachments = extract_attachments(msg)
-    print_attachments(attachments)
-    print_findings("Attachment Findings", check_attachments(attachments))
+    report = build_report(msg)
+    print_report(report)
 
 
 
